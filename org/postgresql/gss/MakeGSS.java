@@ -11,10 +11,12 @@ package org.postgresql.gss;
 import org.ietf.jgss.*;
 import javax.security.auth.Subject;
 import javax.security.auth.login.LoginContext;
+import java.security.AccessController;
 import java.security.PrivilegedAction;
 
 import java.io.IOException;
 import java.sql.SQLException;
+import java.util.Set;
 
 import org.postgresql.core.PGStream;
 import org.postgresql.core.Logger;
@@ -37,11 +39,21 @@ public class MakeGSS
             kerberosServerName = "postgres";
 
         try {
-            LoginContext lc = new LoginContext(jaasApplicationName, new GSSCallbackHandler(user, password));
-            lc.login();
-
-            Subject sub = lc.getSubject();
-            PrivilegedAction action = new GssAction(pgStream, host, user, password, kerberosServerName, logger, useSpnego);
+            PrivilegedAction action = null;
+            Subject sub = Subject.getSubject(AccessController.getContext());
+            if(sub == null) {
+                LoginContext lc = new LoginContext(jaasApplicationName, new GSSCallbackHandler(user, password));
+                lc.login();
+                sub = lc.getSubject();
+                action = new CreateGssCredentialsGssAction(pgStream, host, user, password, kerberosServerName, logger, useSpnego);
+            } else {
+                Set<GSSCredential> gssCreds = sub.getPrivateCredentials(GSSCredential.class);
+                if (gssCreds != null && gssCreds.size() > 0) {
+                    action = new ReuseGssCredentialsGssAction(pgStream, gssCreds.iterator().next(), host, kerberosServerName, logger);
+                } else {
+                    throw new PSQLException(GT.tr("GSS No valid credentials in subject"), PSQLState.CONNECTION_FAILURE);
+                }
+            }
             result = Subject.doAs(sub, action);
         } catch (Exception e) {
             throw new PSQLException(GT.tr("GSS Authentication failed"), PSQLState.CONNECTION_FAILURE, e);
@@ -58,7 +70,91 @@ public class MakeGSS
 
 }
 
-class GssAction implements PrivilegedAction
+class ReuseGssCredentialsGssAction implements PrivilegedAction {
+    private final PGStream pgStream;
+    private final String host;
+    private final String kerberosServerName;
+    private final Logger logger;
+    private final GSSCredential gssCredential;
+
+    public ReuseGssCredentialsGssAction(PGStream pgStream, GSSCredential gssCredential, String host, String kerberosServerName, Logger logger) {
+      this.pgStream = pgStream;
+      this.host = host;
+      this.kerberosServerName = kerberosServerName;
+      this.logger = logger;
+      this.gssCredential = gssCredential;
+    }
+
+    @Override
+    public Object run() {
+        try {
+            GSSManager manager = GSSManager.getInstance();
+            Oid krb5 = new Oid("1.2.840.113554.1.2.2");
+            GSSName gssName = gssCredential.getName(krb5);
+            GSSName serverName = manager.createName(kerberosServerName + "@" + host, GSSName.NT_HOSTBASED_SERVICE);
+
+            GSSContext secContext = manager.createContext(serverName, krb5, gssCredential, GSSContext.DEFAULT_LIFETIME);
+            secContext.requestMutualAuth(true);
+
+            byte inToken[] = new byte[0];
+            byte outToken[] = null;
+
+            boolean established = false;
+            while (!established) {
+                outToken = secContext.initSecContext(inToken, 0, inToken.length);
+
+
+                if (outToken != null) {
+                    if (logger.logDebug())
+                        logger.debug(" FE=> Password(GSS Authentication Token)");
+
+                    pgStream.SendChar('p');
+                    pgStream.SendInteger4(4 + outToken.length);
+                    pgStream.Send(outToken);
+                    pgStream.flush();
+                }
+
+                if (!secContext.isEstablished()) {
+                    int response = pgStream.ReceiveChar();
+                    // Error
+                    if (response == 'E') {
+                        int l_elen = pgStream.ReceiveInteger4();
+                        ServerErrorMessage l_errorMsg = new ServerErrorMessage(pgStream.ReceiveString(l_elen - 4), logger.getLogLevel());
+
+                        if (logger.logDebug())
+                            logger.debug(" <=BE ErrorMessage(" + l_errorMsg + ")");
+
+                        return new PSQLException(l_errorMsg);
+
+                    } else if (response == 'R') {
+
+                        if (logger.logDebug())
+                            logger.debug(" <=BE AuthenticationGSSContinue");
+
+                        int len = pgStream.ReceiveInteger4();
+                        int type = pgStream.ReceiveInteger4();
+                        // should check type = 8
+                        inToken = pgStream.Receive(len - 8);
+                    } else {
+                        // Unknown/unexpected message type.
+                        return new PSQLException(GT.tr("Protocol error.  Session setup failed."), PSQLState.CONNECTION_UNABLE_TO_CONNECT);
+                    }
+                } else {
+                    established = true;
+                }
+            }
+
+        } catch (IOException e) {
+            return e;
+        } catch (GSSException gsse) {
+            return new PSQLException(GT.tr("GSS Authentication failed"), PSQLState.CONNECTION_FAILURE, gsse);
+        }
+
+        return null;
+    }
+}
+
+class CreateGssCredentialsGssAction implements PrivilegedAction
 {
     private final PGStream pgStream;
     private final String host;
@@ -68,7 +164,7 @@ class GssAction implements PrivilegedAction
     private final Logger logger;
     private final boolean useSpnego;
 
-    public GssAction(PGStream pgStream, String host, String user, String password, String kerberosServerName, Logger logger, boolean useSpnego)
+    public CreateGssCredentialsGssAction(PGStream pgStream, String host, String user, String password, String kerberosServerName, Logger logger, boolean useSpnego)
     {
         this.pgStream = pgStream;
         this.host = host;
